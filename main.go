@@ -30,12 +30,12 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Health check endpoints (for ArgoCD / Kubernetes probes)
-	mux.HandleFunc("GET /healthz", handleLiveness)
-	mux.HandleFunc("GET /readyz", handleReadiness)
+	mux.HandleFunc("GET /api/healthz", handleLiveness)
+	mux.HandleFunc("GET /api/readyz", handleReadiness)
 
 	// Data endpoints
-	mux.HandleFunc("GET /data", handleGetData)
-	mux.HandleFunc("PATCH /data", handlePatchData)
+	mux.HandleFunc("GET /api/data", handleGetData)
+	mux.HandleFunc("PATCH /api/data", handlePatchData)
 
 	// Middleware chain: logging → CORS → router
 	handler := loggingMiddleware(corsMiddleware(mux))
@@ -46,10 +46,10 @@ func main() {
 	}
 
 	log.Printf("🚀 Server starting on :%s", port)
-	log.Printf("   GET  /healthz  — Liveness probe         → {status}")
-	log.Printf("   GET  /readyz   — Readiness probe        → {status}")
-	log.Printf("   GET  /data     — Get current data       → {name, message}")
-	log.Printf("   PATCH /data    — Update name/message    ← {name?, message?} → {name, message}")
+	log.Printf("   GET  /api/healthz  — Liveness probe         → {status}")
+	log.Printf("   GET  /api/readyz   — Readiness probe        → {status}")
+	log.Printf("   GET  /api/data     — Get current data       → {name, message}")
+	log.Printf("   PATCH /api/data    — Update name/message    ← {name?, message?} → {name, message}")
 
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
