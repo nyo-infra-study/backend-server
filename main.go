@@ -1,13 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 // Data represents the stored name and message.
@@ -16,16 +19,16 @@ type Data struct {
 	Message string `json:"message"`
 }
 
-const dataFile = "data.json"
-
-var (
-	mu   sync.RWMutex
-	data Data
-)
+var db *sql.DB
 
 func main() {
-	// Load existing data from file (if any)
-	loadData()
+	// 0. Load .env file (for local dev)
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, relying on environment variables.")
+	}
+
+	// 1. Connect to Database
+	connectDB()
 
 	mux := http.NewServeMux()
 
@@ -46,113 +49,148 @@ func main() {
 	}
 
 	log.Printf("🚀 Server starting on :%s", port)
-	log.Printf("   GET  /api/healthz  — Liveness probe         → {status}")
-	log.Printf("   GET  /api/readyz   — Readiness probe        → {status}")
-	log.Printf("   GET  /api/data     — Get current data       → {name, message}")
-	log.Printf("   PATCH /api/data    — Update name/message    ← {name?, message?} → {name, message}")
+	log.Printf("   GET  /api/healthz  — Liveness probe")
+	log.Printf("   GET  /api/readyz   — Readiness probe")
+	log.Printf("   GET  /api/data     — Get current data")
+	log.Printf("   PATCH /api/data    — Update name/message")
 
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
 
-// --- Health Checks ---
+func connectDB() {
+	host := os.Getenv("DB_HOST")
+	port := os.Getenv("DB_PORT")
+	user := os.Getenv("DB_USER")
+	password := os.Getenv("DB_PASSWORD")
+	dbname := os.Getenv("DB_NAME")
 
-// handleLiveness returns 200 if the process is alive.
-// ArgoCD/K8s uses this to know if the container needs a restart.
-func handleLiveness(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	if host == "" {
+		log.Fatal("DB_HOST env var is required")
+	}
+
+	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname)
+
+	var err error
+	db, err = sql.Open("postgres", psqlInfo)
+	if err != nil {
+		log.Fatalf("Failed to open DB connection: %v", err)
+	}
+
+	// Verify connection
+	if err = db.Ping(); err != nil {
+		log.Printf("Warning: DB unreachable (will retry in Readiness probe): %v", err)
+	} else {
+		log.Println("✅ Connected to PostgreSQL!")
+	}
+
+	// Create table if not exists
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id SERIAL PRIMARY KEY,
+		name TEXT NOT NULL,
+		message TEXT NOT NULL
+	);
+	`
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Printf("Warning: failed to create table: %v", err)
+	}
+
+	// Ensure at least one row exists
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
+	if err != nil {
+		log.Printf("Warning: failed to count rows: %v", err)
+	} else if count == 0 {
+		_, err = db.Exec("INSERT INTO messages (name, message) VALUES ($1, $2)", "World", "Hello from Postgres!")
+		if err != nil {
+			log.Printf("Warning: failed to insert initial data: %v", err)
+		} else {
+			log.Println("Initialized DB with default data.")
+		}
+	}
 }
 
-// handleReadiness returns 200 if the server is ready to accept traffic.
-// ArgoCD/K8s uses this to know if the pod should receive requests.
-func handleReadiness(w http.ResponseWriter, r *http.Request) {
-	// Check if we can read/write the data file as a readiness signal
-	mu.RLock()
-	defer mu.RUnlock()
+// --- Health Checks ---
 
-	w.Header().Set("Content-Type", "application/json")
+func handleLiveness(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	w.Write([]byte(`{"status": "alive"}`))
+}
+
+func handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		log.Printf("Readiness check failed: %v", err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "ready"}`))
 }
 
 // --- Data Endpoints ---
 
-// handleGetData returns the current name and message.
 func handleGetData(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	var d Data
+	// We only care about the latest row, or specifically row ID 1 if single-row
+	// For simplicity, let's just grab the first row.
+	err := db.QueryRow("SELECT name, message FROM messages ORDER BY id LIMIT 1").Scan(&d.Name, &d.Message)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "db query failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(d)
 }
 
-// handlePatchData allows partial updates to name and/or message.
 func handlePatchData(w http.ResponseWriter, r *http.Request) {
-	var patch Data
+	var patch struct {
+		Name    *string `json:"name"`
+		Message *string `json:"message"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error": "invalid JSON: %v"}`, err), http.StatusBadRequest)
+		http.Error(w, `{"error": "invalid JSON"}`, http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("  ← req body: {name: %q, message: %q}", patch.Name, patch.Message)
+	// Update logic: we update the first row we find.
+	// In a real app we'd target by ID.
+	query := "UPDATE messages SET "
+	args := []interface{}{}
+	argId := 1
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Only update fields that are provided (non-empty)
-	if patch.Name != "" {
-		data.Name = patch.Name
+	if patch.Name != nil {
+		query += fmt.Sprintf("name = $%d, ", argId)
+		args = append(args, *patch.Name)
+		argId++
 	}
-	if patch.Message != "" {
-		data.Message = patch.Message
-	}
-
-	// Persist to file
-	if err := saveData(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error": "failed to save: %v"}`, err), http.StatusInternalServerError)
-		return
+	if patch.Message != nil {
+		query += fmt.Sprintf("message = $%d, ", argId)
+		args = append(args, *patch.Message)
+		argId++
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	// Remove trailing comma
+	if len(args) > 0 {
+		query = query[:len(query)-2]
+		query += " WHERE id = (SELECT id FROM messages ORDER BY id LIMIT 1)"
 
-	log.Printf("  → res body: {name: %q, message: %q}", data.Name, data.Message)
+		_, err := db.Exec(query, args...)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "db update failed: %v"}`, err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Return updated data
+	handleGetData(w, r)
 }
 
-// --- Persistence ---
-
-func loadData() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	file, err := os.ReadFile(dataFile)
-	if err != nil {
-		// File doesn't exist yet — start with defaults
-		data = Data{Name: "World", Message: "Hello from Go!"}
-		log.Printf("No existing %s found, starting with defaults", dataFile)
-		return
-	}
-
-	if err := json.Unmarshal(file, &data); err != nil {
-		log.Printf("Warning: could not parse %s, starting with defaults: %v", dataFile, err)
-		data = Data{Name: "World", Message: "Hello from Go!"}
-	}
-}
-
-// saveData writes the current data to the JSON file.
-// Caller must hold mu.Lock().
-func saveData() error {
-	file, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dataFile, file, 0644)
-}
-
-// --- CORS Middleware ---
+// --- Middleware ---
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -160,47 +198,18 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Handle preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
-}
-
-// --- Logging Middleware ---
-
-// statusRecorder wraps http.ResponseWriter to capture the status code.
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	r.statusCode = code
-	r.ResponseWriter.WriteHeader(code)
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-
-		// Wrap writer to capture status code
-		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-
-		next.ServeHTTP(rec, r)
-
-		duration := time.Since(start)
-		contentType := rec.Header().Get("Content-Type")
-
-		log.Printf("%s %s → %d (%s) [%s]",
-			r.Method,
-			r.URL.Path,
-			rec.statusCode,
-			contentType,
-			duration,
-		)
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s [%s]", r.Method, r.URL.Path, time.Since(start))
 	})
 }

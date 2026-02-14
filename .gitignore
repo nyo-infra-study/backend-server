@@ -1,2 +1,11 @@
-# binary files 
-backend-server 
+# Binaries
+backend-server
+
+# Environment variables
+.env
+
+# MacOS
+.DS_Store
+
+# Data file (if using JSON storage)
+data.json
