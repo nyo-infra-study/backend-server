@@ -22,7 +22,7 @@ go build -o backend-server .
 ./backend-server
 ```
 
-Server starts on port `8080` by default. Set `PORT` env var to change it.
+Server starts on port `9000` by default. Set `PORT` env var to change it.
 
 Data is persisted to `data.json` in the working directory.
 
@@ -37,7 +37,7 @@ docker build -t backend-server .
 ### Run
 
 ```bash
-docker run -p 8080:8080 backend-server
+docker run -p 9000:9000 backend-server
 ```
 
 ### Push to Docker Hub
@@ -71,15 +71,15 @@ spec:
         - name: backend-server
           image: <your-dockerhub-username>/backend-server:latest
           ports:
-            - containerPort: 8080
+            - containerPort: 9000
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
+              port: 9000
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8080
+              port: 9000
 ---
 apiVersion: v1
 kind: Service
@@ -89,6 +89,6 @@ spec:
   selector:
     app: backend-server
   ports:
-    - port: 8080
-      targetPort: 8080
+    - port: 9000
+      targetPort: 9000
 ```
