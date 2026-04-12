@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/grafana/pyroscope-go"
@@ -215,6 +216,11 @@ func connectDB() {
 		log.Fatalf("Failed to open DB connection: %v", err)
 	}
 
+	// Performance Optimization: Cap the memory and connection overhead
+	db.SetMaxOpenConns(25)                 // Max concurrent connections to the DB
+	db.SetMaxIdleConns(25)                 // Max idle connections to keep open
+	db.SetConnMaxLifetime(5 * time.Minute) // Recycle connections safely to prevent leaks
+
 	// Verify connection
 	if err = db.Ping(); err != nil {
 		log.Printf("Warning: DB unreachable (will retry in Readiness probe): %v", err)
@@ -291,23 +297,25 @@ func handlePatchData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "UPDATE messages SET "
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString("UPDATE messages SET ")
 	args := []interface{}{}
 	argId := 1
 
 	if patch.Name != nil {
-		query += fmt.Sprintf("name = $%d, ", argId)
+		queryBuilder.WriteString(fmt.Sprintf("name = $%d, ", argId))
 		args = append(args, *patch.Name)
 		argId++
 	}
 	if patch.Message != nil {
-		query += fmt.Sprintf("message = $%d, ", argId)
+		queryBuilder.WriteString(fmt.Sprintf("message = $%d, ", argId))
 		args = append(args, *patch.Message)
 		argId++
 	}
 
 	if len(args) > 0 {
-		query = query[:len(query)-2]
+		query := queryBuilder.String()
+		query = query[:len(query)-2] // Remove trailing comma and space
 		query += " WHERE id = (SELECT id FROM messages ORDER BY id LIMIT 1)"
 
 		_, err := db.Exec(query, args...)
