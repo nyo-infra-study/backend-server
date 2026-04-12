@@ -17,6 +17,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -176,6 +177,11 @@ func initOpenTelemetry() func(context.Context) error {
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(5*time.Second))),
 	)
 	otel.SetMeterProvider(meterProvider)
+	
+	// 4. Start Go runtime metrics instrumentation
+	if err := runtime.Start(runtime.WithMeterProvider(meterProvider)); err != nil {
+		log.Printf("⚠️  Failed to start Go runtime metrics context: %v", err)
+	}
 
 	log.Printf("📊 OpenTelemetry metrics/traces started → %s", endpoint)
 
