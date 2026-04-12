@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/grafana/pyroscope-go"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -27,7 +28,10 @@ func main() {
 		log.Println("No .env file found, relying on environment variables.")
 	}
 
-	// 1. Connect to Database
+	// 1. Initialize Pyroscope profiler (no-op if PYROSCOPE_URL is not set)
+	initPyroscope()
+
+	// 2. Connect to Database
 	connectDB()
 
 	mux := http.NewServeMux()
@@ -57,6 +61,35 @@ func main() {
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// initPyroscope starts the Pyroscope continuous profiler.
+// It reads PYROSCOPE_URL from env; if not set, profiling is disabled.
+func initPyroscope() {
+	pyroscopeURL := os.Getenv("PYROSCOPE_URL")
+	if pyroscopeURL == "" {
+		log.Println("ℹ️  PYROSCOPE_URL not set — profiling disabled")
+		return
+	}
+
+	_, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "backend-server",
+		ServerAddress:   pyroscopeURL,
+		Logger:          nil, // use default (no-op)
+		ProfileTypes: []pyroscope.ProfileType{
+			pyroscope.ProfileCPU,
+			pyroscope.ProfileAllocObjects,
+			pyroscope.ProfileAllocSpace,
+			pyroscope.ProfileInuseObjects,
+			pyroscope.ProfileInuseSpace,
+			pyroscope.ProfileGoroutines,
+		},
+	})
+	if err != nil {
+		log.Printf("⚠️  Pyroscope failed to start: %v", err)
+		return
+	}
+	log.Printf("🔥 Pyroscope profiler started → %s", pyroscopeURL)
 }
 
 func connectDB() {
