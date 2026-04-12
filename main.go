@@ -1,17 +1,29 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"time"
 
 	"github.com/grafana/pyroscope-go"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // Data represents the stored name and message.
@@ -28,15 +40,28 @@ func main() {
 		log.Println("No .env file found, relying on environment variables.")
 	}
 
-	// 1. Initialize Pyroscope profiler (no-op if PYROSCOPE_URL is not set)
+	// 1. Initialize OpenTelemetry (Traces & Metrics)
+	shutdownOTel := initOpenTelemetry()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownOTel != nil {
+			if err := shutdownOTel(ctx); err != nil {
+				log.Printf("Failed to shutdown OTel: %v", err)
+			}
+		}
+	}()
+
+	// 2. Initialize Pyroscope profiler (no-op if PYROSCOPE_URL is not set)
 	initPyroscope()
 
-	// 2. Connect to Database
+	// 3. Connect to Database
 	connectDB()
 
 	mux := http.NewServeMux()
 
 	// Health check endpoints (for ArgoCD / Kubernetes probes)
+	// We don't trace health checks to avoid noise
 	mux.HandleFunc("GET /api/healthz", handleLiveness)
 	mux.HandleFunc("GET /api/readyz", handleReadiness)
 
@@ -44,27 +69,105 @@ func main() {
 	mux.HandleFunc("GET /api/data", handleGetData)
 	mux.HandleFunc("PATCH /api/data", handlePatchData)
 
-	// Middleware chain: logging → CORS → router
-	handler := loggingMiddleware(corsMiddleware(mux))
+	// Middleware chain: OTel tracing -> logging → CORS → router
+	// This ensures incoming requests are automatically wrapped in a distributed span!
+	handler := otelhttp.NewHandler(loggingMiddleware(corsMiddleware(mux)), "backend-server")
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9000"
 	}
 
-	log.Printf("🚀 Server starting on :%s", port)
-	log.Printf("   GET  /api/healthz  — Liveness probe")
-	log.Printf("   GET  /api/readyz   — Readiness probe")
-	log.Printf("   GET  /api/data     — Get current data")
-	log.Printf("   PATCH /api/data    — Update name/message")
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: handler,
+	}
 
-	if err := http.ListenAndServe(":"+port, handler); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	go func() {
+		log.Printf("🚀 Server starting on :%s", port)
+		log.Printf("   GET  /api/healthz  — Liveness probe")
+		log.Printf("   GET  /api/readyz   — Readiness probe")
+		log.Printf("   GET  /api/data     — Get current data")
+		log.Printf("   PATCH /api/data    — Update name/message")
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal to gracefully shutdown the server
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+}
+
+// initOpenTelemetry configures the OTel SDK to export to the collector via gRPC
+func initOpenTelemetry() func(context.Context) error {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		log.Println("ℹ️  OTEL_EXPORTER_OTLP_ENDPOINT not set — traces/metrics disabled")
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// 1. Identify the application
+	res, err := resource.New(ctx,
+		resource.WithAttributes(attribute.String("service.name", "backend-server")),
+	)
+	if err != nil {
+		log.Printf("⚠️  Failed to create OTel resource: %v", err)
+		return nil
+	}
+
+	// 2. Set up Trace Provider pushing to OTLP
+	traceExporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		log.Printf("⚠️  Failed to create trace exporter: %v", err)
+		return nil
+	}
+	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res),
+		sdktrace.WithSpanProcessor(bsp),
+	)
+	otel.SetTracerProvider(tracerProvider)
+
+	// Propagator ensures traces cross service boundaries via HTTP headers
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	// 3. Set up Metric Provider pushing to OTLP
+	metricExporter, err := otlpmetricgrpc.New(ctx)
+	if err != nil {
+		log.Printf("⚠️  Failed to create metric exporter: %v", err)
+		return nil
+	}
+	meterProvider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(5*time.Second))),
+	)
+	otel.SetMeterProvider(meterProvider)
+
+	log.Printf("📊 OpenTelemetry metrics/traces started → %s", endpoint)
+
+	// Return a shutdown function for graceful exit
+	return func(ctx context.Context) error {
+		if err := tracerProvider.Shutdown(ctx); err != nil {
+			return err
+		}
+		return meterProvider.Shutdown(ctx)
 	}
 }
 
 // initPyroscope starts the Pyroscope continuous profiler.
-// It reads PYROSCOPE_URL from env; if not set, profiling is disabled.
 func initPyroscope() {
 	pyroscopeURL := os.Getenv("PYROSCOPE_URL")
 	if pyroscopeURL == "" {
@@ -168,8 +271,6 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 func handleGetData(w http.ResponseWriter, r *http.Request) {
 	var d Data
-	// We only care about the latest row, or specifically row ID 1 if single-row
-	// For simplicity, let's just grab the first row.
 	err := db.QueryRow("SELECT name, message FROM messages ORDER BY id LIMIT 1").Scan(&d.Name, &d.Message)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "db query failed: %v"}`, err), http.StatusInternalServerError)
@@ -190,8 +291,6 @@ func handlePatchData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update logic: we update the first row we find.
-	// In a real app we'd target by ID.
 	query := "UPDATE messages SET "
 	args := []interface{}{}
 	argId := 1
@@ -207,7 +306,6 @@ func handlePatchData(w http.ResponseWriter, r *http.Request) {
 		argId++
 	}
 
-	// Remove trailing comma
 	if len(args) > 0 {
 		query = query[:len(query)-2]
 		query += " WHERE id = (SELECT id FROM messages ORDER BY id LIMIT 1)"
@@ -219,7 +317,6 @@ func handlePatchData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Return updated data
 	handleGetData(w, r)
 }
 

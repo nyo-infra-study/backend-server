@@ -43,8 +43,8 @@ docker run -p 9000:9000 backend-server
 ### Push to Docker Hub
 
 ```bash
-docker tag backend-server <your-dockerhub-username>/backend-server:latest
-docker push <your-dockerhub-username>/backend-server:latest
+docker tag backend-server skimpjr/backend-server:latest
+docker push skimpjr/backend-server:latest
 ```
 
 ## Kubernetes (via Helm + ArgoCD)
