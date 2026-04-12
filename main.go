@@ -43,15 +43,7 @@ func main() {
 
 	// 1. Initialize OpenTelemetry (Traces & Metrics)
 	shutdownOTel := initOpenTelemetry()
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if shutdownOTel != nil {
-			if err := shutdownOTel(ctx); err != nil {
-				log.Printf("Failed to shutdown OTel: %v", err)
-			}
-		}
-	}()
+	// Shutdown is now handled explicitly at the end of main() to ensure final flush
 
 	// 2. Initialize Pyroscope profiler (no-op if PYROSCOPE_URL is not set)
 	initPyroscope()
@@ -102,11 +94,24 @@ func main() {
 	<-quit
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Create a context for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// 1. Stop accepting new requests
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+	log.Println("HTTP server stopped.")
+
+	// 2. Flush and shutdown OTel (Captures final spans/metrics from the shutdown itself)
+	if shutdownOTel != nil {
+		log.Println("Flushing telemetry...")
+		if err := shutdownOTel(ctx); err != nil {
+			log.Printf("Failed to shutdown OTel: %v", err)
+		}
+	}
+	log.Println("Shutdown complete.")
 }
 
 // initOpenTelemetry configures the OTel SDK to export to the collector via gRPC
@@ -129,7 +134,15 @@ func initOpenTelemetry() func(context.Context) error {
 	}
 
 	// 2. Set up Trace Provider pushing to OTLP
-	traceExporter, err := otlptracegrpc.New(ctx)
+	// Added retry logic for resilience if the collector is temporarily down
+	traceExporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithRetry(otlptracegrpc.RetryConfig{
+			Enabled:         true,
+			InitialInterval: 1 * time.Second,
+			MaxInterval:     5 * time.Second,
+			MaxElapsedTime:  30 * time.Second,
+		}),
+	)
 	if err != nil {
 		log.Printf("⚠️  Failed to create trace exporter: %v", err)
 		return nil
@@ -146,7 +159,14 @@ func initOpenTelemetry() func(context.Context) error {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	// 3. Set up Metric Provider pushing to OTLP
-	metricExporter, err := otlpmetricgrpc.New(ctx)
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithRetry(otlpmetricgrpc.RetryConfig{
+			Enabled:         true,
+			InitialInterval: 1 * time.Second,
+			MaxInterval:     5 * time.Second,
+			MaxElapsedTime:  30 * time.Second,
+		}),
+	)
 	if err != nil {
 		log.Printf("⚠️  Failed to create metric exporter: %v", err)
 		return nil
