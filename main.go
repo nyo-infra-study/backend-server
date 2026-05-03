@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Data represents the stored name and message.
@@ -41,6 +43,11 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, relying on environment variables.")
 	}
+
+	// Set up structured JSON logging for trace correlation
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 
 	// 1. Initialize OpenTelemetry (Traces & Metrics)
 	shutdownOTel := initOpenTelemetry()
@@ -374,6 +381,21 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s [%s]", r.Method, r.URL.Path, time.Since(start))
+		duration := time.Since(start)
+
+		// Extract trace context for log-trace correlation in SigNoz
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		attrs := []slog.Attr{
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("duration", duration.String()),
+		}
+		if spanCtx.HasTraceID() {
+			attrs = append(attrs,
+				slog.String("trace_id", spanCtx.TraceID().String()),
+				slog.String("span_id", spanCtx.SpanID().String()),
+			)
+		}
+		slog.LogAttrs(r.Context(), slog.LevelInfo, "http request", attrs...)
 	})
 }
