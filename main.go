@@ -71,8 +71,14 @@ func main() {
 	mux.HandleFunc("PATCH /api/data", handlePatchData)
 
 	// Middleware chain: OTel tracing -> logging → CORS → router
-	// This ensures incoming requests are automatically wrapped in a distributed span!
-	handler := otelhttp.NewHandler(loggingMiddleware(corsMiddleware(mux)), "backend-server")
+	// Use WithSpanNameFormatter to get the actual route in the span name
+	handler := otelhttp.NewHandler(
+		loggingMiddleware(corsMiddleware(mux)),
+		"backend-server",
+		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+			return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+		}),
+	)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -309,18 +315,31 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 // --- Data Endpoints ---
 
 func handleGetData(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := otel.Tracer("backend-server").Start(ctx, "db.query SELECT messages")
+	defer span.End()
+
 	var d Data
-	err := db.QueryRow("SELECT name, message FROM messages ORDER BY id LIMIT 1").Scan(&d.Name, &d.Message)
+	err := db.QueryRowContext(ctx, "SELECT name, message FROM messages ORDER BY id LIMIT 1").Scan(&d.Name, &d.Message)
 	if err != nil {
+		span.RecordError(err)
 		http.Error(w, fmt.Sprintf(`{"error": "db query failed: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
+
+	span.SetAttributes(
+		attribute.String("db.system", "postgresql"),
+		attribute.String("db.operation", "SELECT"),
+		attribute.String("db.sql.table", "messages"),
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(d)
 }
 
 func handlePatchData(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	var patch struct {
 		Name    *string `json:"name"`
 		Message *string `json:"message"`
@@ -351,11 +370,21 @@ func handlePatchData(w http.ResponseWriter, r *http.Request) {
 		query = query[:len(query)-2] // Remove trailing comma and space
 		query += " WHERE id = (SELECT id FROM messages ORDER BY id LIMIT 1)"
 
-		_, err := db.Exec(query, args...)
+		_, dbSpan := otel.Tracer("backend-server").Start(ctx, "db.exec UPDATE messages")
+		_, err := db.ExecContext(ctx, query, args...)
 		if err != nil {
+			dbSpan.RecordError(err)
+			dbSpan.End()
 			http.Error(w, fmt.Sprintf(`{"error": "db update failed: %v"}`, err), http.StatusInternalServerError)
 			return
 		}
+		dbSpan.SetAttributes(
+			attribute.String("db.system", "postgresql"),
+			attribute.String("db.operation", "UPDATE"),
+			attribute.String("db.sql.table", "messages"),
+			attribute.String("db.statement", query),
+		)
+		dbSpan.End()
 	}
 
 	handleGetData(w, r)
