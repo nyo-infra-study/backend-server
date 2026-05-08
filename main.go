@@ -17,13 +17,16 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -45,11 +48,12 @@ func main() {
 	}
 
 	// Set up structured JSON logging for trace correlation
+	// Will be replaced with OTel slog bridge after OTel init
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
-	// 1. Initialize OpenTelemetry (Traces & Metrics)
+	// 1. Initialize OpenTelemetry (Traces & Metrics & Logs)
 	shutdownOTel := initOpenTelemetry()
 	// Shutdown is now handled explicitly at the end of main() to ensure final flush
 
@@ -194,6 +198,23 @@ func initOpenTelemetry() func(context.Context) error {
 	// 4. Start Go runtime metrics instrumentation
 	if err := runtime.Start(runtime.WithMeterProvider(meterProvider)); err != nil {
 		log.Printf("⚠️  Failed to start Go runtime metrics context: %v", err)
+	}
+
+	// 5. Set up Log Provider pushing to OTLP
+	logExporter, err := otlploggrpc.New(ctx)
+	if err != nil {
+		log.Printf("⚠️  Failed to create log exporter: %v", err)
+	} else {
+		logProvider := sdklog.NewLoggerProvider(
+			sdklog.WithResource(res),
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+		)
+		// Replace default slog with OTel bridge — logs now export via OTLP
+		// with automatic trace_id/span_id correlation
+		slog.SetDefault(otelslog.NewLogger("backend-server",
+			otelslog.WithLoggerProvider(logProvider),
+		))
+		log.Printf("📝 OpenTelemetry logs started (slog → OTLP)")
 	}
 
 	log.Printf("📊 OpenTelemetry metrics/traces started → %s", endpoint)
