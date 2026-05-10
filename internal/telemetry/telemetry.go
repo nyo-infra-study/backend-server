@@ -34,8 +34,10 @@ func Init(cfg *config.Config) func(context.Context) error {
 		Level: slog.LevelInfo,
 	})))
 
-	shutdownOTel := initOpenTelemetry(cfg)
+	// Pyroscope must start BEFORE OTel so the otel-profiling-go wrapper
+	// can tag profile samples with span IDs
 	initPyroscope(cfg)
+	shutdownOTel := initOpenTelemetry(cfg)
 
 	return shutdownOTel
 }
