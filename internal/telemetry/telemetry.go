@@ -34,10 +34,14 @@ func Init(cfg *config.Config) func(context.Context) error {
 		Level: slog.LevelInfo,
 	})))
 
-	// Pyroscope must start BEFORE OTel so the otel-profiling-go wrapper
-	// can tag profile samples with span IDs
-	initPyroscope(cfg)
+	// OTel must be initialized first, then Pyroscope.
+	// The otelpyroscope wrapper adds pprof labels with span IDs during span execution.
+	// Pyroscope SDK then picks up those labels when collecting samples.
+	//
+	// NOTE: Span-level profiles only work for spans that use more than 10ms of CPU
+	// (the pprof sampling interval). Short spans won't have profile data.
 	shutdownOTel := initOpenTelemetry(cfg)
+	initPyroscope(cfg)
 
 	return shutdownOTel
 }
