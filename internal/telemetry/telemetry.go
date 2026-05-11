@@ -55,7 +55,12 @@ func initOpenTelemetry(cfg *config.Config) func(context.Context) error {
 	ctx := context.Background()
 
 	res, err := resource.New(ctx,
-		resource.WithAttributes(attribute.String("service.name", cfg.OTelServiceName)),
+		resource.WithAttributes(
+			attribute.String("service.name", cfg.OTelServiceName),
+			attribute.String("service.namespace", getEnvOrDefault("OTEL_SERVICE_NAMESPACE", "dev")),
+			attribute.String("service.version", getEnvOrDefault("OTEL_SERVICE_VERSION", "unknown")),
+			attribute.String("deployment.environment", getEnvOrDefault("OTEL_DEPLOYMENT_ENVIRONMENT", "dev")),
+		),
 	)
 	if err != nil {
 		log.Printf("⚠️  Failed to create OTel resource: %v", err)
@@ -134,6 +139,13 @@ func initOpenTelemetry(cfg *config.Config) func(context.Context) error {
 		}
 		return meterProvider.Shutdown(ctx)
 	}
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func initPyroscope(cfg *config.Config) {
